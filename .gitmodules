@@ -1,0 +1,9 @@
+# 논문 코드를 submodule로 추가하는 방법:
+# git submodule add <repo_url> papers/<name>
+#
+# 예시:
+# git submodule add https://github.com/openvla/openvla.git papers/openvla
+# git submodule add https://github.com/octo-models/octo.git papers/octo
+#
+# 전체 초기화:
+# git submodule update --init --recursive

@@ -1,0 +1,28 @@
+# Example experiment config
+experiment:
+  name: "baseline_vla"
+  seed: 42
+
+model:
+  name: "openvla"
+  pretrained: true
+  checkpoint: null
+
+training:
+  batch_size: 16
+  learning_rate: 1.0e-4
+  epochs: 100
+  optimizer: "adamw"
+  weight_decay: 0.01
+  warmup_steps: 1000
+
+data:
+  dataset: "bridge_v2"
+  train_split: 0.9
+  num_workers: 4
+
+logging:
+  wandb: true
+  project: "robotics-ai-research"
+  log_interval: 100
+  save_interval: 1000

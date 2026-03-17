@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.conda/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_metadata/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & Models (대용량 파일)
+data/**/*.zip
+data/**/*.tar.gz
+data/**/*.h5
+data/**/*.hdf5
+data/**/*.pkl
+data/**/*.parquet
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+checkpoints/
+wandb/
+
+# Results (선택적으로 추적)
+results/**/*.log
+
+# Secrets
+.env
+*.key
