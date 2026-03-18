@@ -358,3 +358,186 @@ VRAM 사용량           ≈ 3.5GB
 1. SmolVLA로 데이터 수집 → fine-tune → 빠른 검증 (노트북)
 2. 같은 LeRobot 데이터를 GR00T에 적용 → 성능 비교 (워크스테이션)
 3. 두 모델의 action 출력 비교 분석 → 연구 인사이트 도출
+
+---
+
+## 10. 핵심 코드 분석 (modeling_smolvla.py)
+
+### 10.1 클래스 구조
+
+```
+SmolVLAPolicy (최상위 — 학습/추론 인터페이스)
+  └── VLAFlowMatching (모델 본체)
+        ├── SmolVLMWithExpertModel (VLM + Action Expert 통합)
+        │     ├── vlm (SmolVLM-2, frozen)
+        │     │    ├── vision_model (SigLIP)
+        │     │    ├── connector (PixelShuffle)
+        │     │    └── text_model.layers[:16] (앞 16 layer만)
+        │     └── lm_expert (Action Expert, trainable)
+        │          └── layers[0..15] (SA/CA interleaved)
+        ├── state_proj (Linear: state → VLM dim)
+        ├── action_in_proj (Linear: action → Expert dim)
+        ├── action_out_proj (Linear: Expert dim → action)
+        └── action_time_mlp (MLP: action+timestep fusion)
+```
+
+다른 VLA(π0, GR00T)와 달리 `VLAFlowMatching`을 별도 클래스로 분리하여
+VLM(perception)과 Action Expert(action generation)가 명확히 독립됨.
+→ VLM frozen + Expert만 학습하는 구조의 핵심 설계.
+
+### 10.2 `forward()` — 학습 시 흐름
+
+```python
+# 1. noise, time 생성
+noise = sample_noise()          # 가우시안 N(0,1)
+time = sample_time()            # Beta(1.5, 1.0) → τ ∈ (0.001, 1.0)
+
+# 2. Flow matching 핵심: noisy action + target velocity
+x_t = τ * noise + (1 - τ) * actions    # interpolation (τ=1: 순수 노이즈, τ=0: GT action)
+u_t = noise - actions                   # 학습 target (velocity field)
+
+# 3. 임베딩
+prefix = embed_prefix(images, lang, state)   # VLM 입력
+suffix = embed_suffix(x_t, time)             # Action Expert 입력
+
+# 4. VLM + Expert forward
+v_t = vlm_with_expert.forward(prefix, suffix)  # 예측 velocity
+
+# 5. Loss
+loss = MSE(u_t, v_t)   # 예측 vs 실제 velocity
+```
+
+### 10.3 `sample_actions()` — 추론 시 흐름
+
+```python
+# 1. prefix를 VLM에 한 번만 통과 → KV cache 저장 ★
+prefix_embeds → vlm_with_expert.forward(fill_kv_cache=True)
+                → past_key_values에 저장
+
+# 2. Denoising loop (10 steps, Euler 적분)
+x_t = noise  # 시작: 순수 노이즈
+for step in range(10):
+    time = 1.0 → 0.0 (점진적으로 감소)
+    v_t = denoise_step(x_t, time)    # suffix만 재계산, prefix는 cache 사용
+    x_t = x_t + dt * v_t             # Euler step
+
+# → 최종 x_t = 예측된 action chunk [batch, 50, action_dim]
+```
+
+**핵심 최적화:** VLM prefix는 KV cache로 1회만 계산, denoising 10 steps 동안은
+Action Expert(suffix)만 반복 실행 → 추론 속도의 핵심
+
+### 10.4 `embed_prefix()` — attention mask 설계
+
+```
+[img_start] + [SigLIP 64 tokens] + [img_end]  ← 카메라별 반복
++ [language tokens]
++ [state token]   ← linear projection으로 1 토큰
+
+att_mask 설정:
+  image/language tokens → att_mask = 0 (서로 attend 가능)
+  state token          → att_mask = 1 (비대칭: state→image/lang OK, image/lang→state X)
+```
+
+state가 image/language를 참조할 수 있지만, image/language는 state를 보지 못하는
+**비대칭 mask**. 논문 ablation에서 state를 prefix(VLM)에 넣는 게 suffix(Expert)에
+넣는 것보다 좋았던 이유가 이 mask 설계 덕분.
+
+### 10.5 `embed_suffix()` — action + timestep fusion
+
+```python
+action_emb = action_in_proj(noisy_actions)        # Linear projection
+time_emb = sinusoidal_embedding(timestep)          # sin/cos positional encoding
+time_emb = time_emb.expand_as(action_emb)          # 모든 action token에 동일 timestep
+
+fused = concat([action_emb, time_emb], dim=-1)     # concat
+fused = MLP(fused)                                  # Linear → SiLU → Linear
+```
+
+timestep embedding이 "denoising의 어느 단계인지"를 Expert에 알려주는 역할.
+
+---
+
+## 11. CA+SA Interleave 구현 상세 (SmolVLMWithExpertModel)
+
+### 11.1 Layer 라우팅 로직
+
+```python
+# self_attn_every_n_layers = 2 → SA/CA 교대
+for layer_idx in range(16):
+    if layer_idx % 2 == 0:     # 짝수: Self-Attention
+        forward_attn_layer()
+    else:                       # 홀수: Cross-Attention
+        forward_cross_attn_layer()
+```
+
+실제 패턴:
+```
+Layer  0: SA ← VLM + Expert 합쳐서 self-attention
+Layer  1: CA ← Expert가 VLM KV를 cross-attend
+Layer  2: SA
+Layer  3: CA
+...
+Layer 14: SA
+Layer 15: CA
+→ 각각 RMSNorm → output
+```
+
+### 11.2 Self-Attention Layer (`forward_attn_layer`)
+
+```
+[VLM prefix tokens | Expert action tokens]
+         ↓ 각각 Q, K, V 생성
+         ↓ concat
+         ↓ RoPE 적용
+         ↓ attention (합쳐진 상태로)
+         ↓ output
+```
+
+VLM과 Expert 토큰이 **서로를 볼 수 있음**.
+Action 토큰들이 다른 action 토큰과 interact하는 레이어.
+(causal mask로 미래 action은 못 봄)
+
+### 11.3 Cross-Attention Layer (`forward_cross_attn_layer`)
+
+```
+Step 1: VLM → self-attention → K, V를 cache에 저장
+Step 2: Expert → Q 생성
+        VLM의 K, V를 가져와서 Expert 차원으로 re-projection ★
+        → cross-attention (Expert Q × VLM KV)
+```
+
+**K, V re-projection이 필요한 이유:**
+VLM hidden_size ≠ Expert hidden_size (Expert는 0.75배) 이므로
+VLM에서 나온 K, V를 Expert 차원에 맞게 다시 project해야 함.
+
+```python
+# __init__에서 CA 레이어의 k_proj, v_proj를 교체:
+k_proj = Linear(VLM_kv_dim → Expert_kv_dim)   # 입력: VLM 차원
+v_proj = Linear(VLM_kv_dim → Expert_kv_dim)   # 출력: Expert 차원
+```
+
+### 11.4 VLM-Expert Layer 매핑
+
+```python
+multiple_of = num_vlm_layers // num_expert_layers
+# 기본: 16 // 16 = 1 → 1:1 매핑 (VLM 1 layer당 Expert 1 layer)
+# 만약 Expert를 8로 줄이면: 16 // 8 = 2 → VLM 2 layer당 Expert 1 layer
+```
+
+Expert layer 수를 줄이면 일부 layer에서 `expert_layer = None`이 되어
+VLM만 실행되고 Expert는 skip됨 → 추가 경량화 가능.
+
+### 11.5 SA vs CA 역할 요약
+
+| | Self-Attention (SA) | Cross-Attention (CA) |
+|---|---|---|
+| 발생 layer | 짝수 (0, 2, 4...) | 홀수 (1, 3, 5...) |
+| 입력 | VLM + Expert 토큰 합침 | 분리: VLM은 self, Expert는 VLM KV 참조 |
+| Expert가 배우는 것 | action 토큰 간 관계 (시간적 일관성) | 현재 관찰에 기반한 action 생성 |
+| 논문 ablation | SA만: 74.5% | CA만: 79.0% |
+| **둘 다 (채택)** | **85.5%** | — |
+
+SA는 **action chunk 내부의 smooth한 trajectory**를 만들고,
+CA는 **이미지/텍스트 맥락에 맞는 action**을 생성함.
+둘을 interleave하는 것이 각각 단독보다 좋은 이유.
