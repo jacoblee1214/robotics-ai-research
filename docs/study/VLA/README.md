@@ -6,26 +6,112 @@
 
 ## 주요 논문 & 모델
 
-### RT-2 (Robotic Transformer 2)
-- **핵심**: VLM을 로봇 행동 생성에 직접 활용
-- **아키텍처**: PaLI-X / PaLM-E 기반
-- **링크**: https://arxiv.org/abs/2307.15818
+### 초기 모델
 
-### OpenVLA
-- **핵심**: 오픈소스 VLA 모델
-- **아키텍처**: Prismatic VLM + Action head
-- **링크**: https://github.com/openvla/openvla
+| 모델 | 핵심 | 아키텍처 |
+|------|------|----------|
+| RT-2 | VLM을 로봇 행동 생성에 직접 활용 | PaLI-X / PaLM-E 기반 |
+| OpenVLA | 오픈소스 VLA | Prismatic VLM + Action head |
+| Octo | Generalist robot policy | Transformer, 다양한 로봇/태스크 범용 |
+| ACT | Action Chunking Transformer | bimanual manipulation 특화 |
 
-### Octo
-- **핵심**: Generalist robot policy
-- **특징**: 다양한 로봇/태스크에 범용 적용
-- **링크**: https://github.com/octo-models/octo
+### 현재 주요 모델 (직접 분석)
+
+| 모델 | 크기 | Action 방식 | 분석 문서 |
+|------|------|-------------|-----------|
+| SmolVLA | 450M | Action Chunking (chunk=50) | [SmolVLA_Analysis.md](SmolVLA_Analysis.md) |
+| GR00T N1.6 | 3B | Flow Matching | [GR00T_N1.6_Script_Analysis.md](GR00T_N1.6_Script_Analysis.md) |
+| X-VLA | 0.9B | Flow Matching (anchor points) | [X-VLA_Analysis.md](X-VLA_Analysis.md) |
+| π0 | PaliGemma 3B | Flow Matching | [pi0_Analysis.md](pi0_Analysis.md) |
+| π0.5 | π0 기반 | FAST + Flow Matching | [pi0_Analysis.md](pi0_Analysis.md) |
+| MoDE-VLA | - | Diffusion (MoDE) | - |
+
+## Action 표현 방식
+
+VLA 모델이 action을 어떻게 생성하는지는 성능과 태스크 적합성에 직결됨.
+
+### Autoregressive (토큰 기반)
+- **대표**: RT-2, OpenVLA
+- action을 이산 토큰으로 변환 → 언어 모델처럼 순차 생성
+- 장점: VLM과 자연스럽게 통합 / 단점: 연속 action 표현에 부자연스러움, 느림
+
+### Action Chunking + Transformer (ACT 방식)
+- **대표**: SmolVLA, ACT
+- 한 번에 N개 action을 chunk로 예측 → open-loop 실행
+- 장점: 빠른 추론, 구현 단순 / 단점: chunk 내 에러 누적, 재계획 불가
+
+### Diffusion Policy
+- **대표**: MoDE-VLA, Diffusion Policy
+- 노이즈에서 action을 점진적으로 복원 (수십~수백 denoising step)
+- 장점: 복잡한 multimodal 분포 표현 가능 / 단점: 추론 느림
+
+### Flow Matching
+- **대표**: X-VLA, GR00T, π0, π0.5
+- Diffusion의 개선판 — 직선 경로로 노이즈 → action 변환 (더 적은 step)
+- 장점: Diffusion보다 빠르고 안정적, 연속 action에 적합
+- X-VLA: 30 anchor points(keyframe) 기반 / GR00T: 8~16 step chunk
+
+### 정리
+
+| 방식 | 속도 | 표현력 | 주요 사용처 |
+|------|------|--------|-------------|
+| Autoregressive | 중간 | 낮음 | 초기 VLA |
+| Action Chunking | 빠름 | 중간 | Short-horizon |
+| Diffusion | 느림 | 높음 | 정밀 조작 |
+| Flow Matching | 빠름 | 높음 | 현재 주류 |
 
 ## 실험 계획
 - [ ] OpenVLA 코드 클론 및 환경 세팅
 - [ ] 사전학습 모델 다운로드 및 inference 테스트
 - [ ] 데이터셋 구조 분석
 - [ ] Fine-tuning 실험
+
+## Task Horizon 분류
+
+VLA 모델이 다루는 태스크를 소요 시간 기준으로 분류.
+
+### 분류 기준
+
+| 분류 | 소요 시간 | 예시 | 대표 모델 |
+|------|-----------|------|-----------|
+| Single-step | 1~5초 | 버튼 누르기, 물건 밀기 (MetaWorld easy) | - |
+| Short-horizon | 5~20초 | pick-and-place, 서랍 열기 | SmolVLA, OpenVLA |
+| Medium-horizon | 20초~2분 | LIBERO-Long, 사과 깎기, 옷 접기 | π0, MoDE-VLA |
+| Long-horizon | 2분~수십 분 | 주방 전체 정리 (여러 방 이동) | π0.5 |
+
+### 시간을 결정하는 요소
+
+**Control frequency (제어 주파수)**
+- SmolVLA: 30Hz / GR00T: 10~27Hz / π0: 50Hz
+
+**Action chunk size**
+- SmolVLA: 50 actions = 약 1.7초 (30Hz 기준)
+- GR00T: 8~16 actions = 약 0.3~1.6초
+- X-VLA: 30 anchor points (keyframe 기반, ~4초 분량)
+
+**Chunk 실행 구조**: task 소요시간 = (chunk 실행시간) × (필요 chunk 수)
+chunk 실행 중 다음 chunk 추론이 open-loop로 병렬 진행됨.
+→ Short-horizon에서는 충분하지만, Long-horizon에서는 취약점이 됨.
+
+### Long-horizon이 어려운 핵심 이유: 메모리 부재
+
+현재 VLA 대부분은 현재 observation만 보고 행동을 결정함.
+"아까 서랍을 열었다"는 사실을 기억하지 못함 → 순차적 sub-task 처리 불가.
+
+π0.5가 long-horizon을 다룰 수 있는 건 **hierarchical 구조** 덕분:
+- High-level planner: 전체 작업 순서 계획
+- Low-level controller: 개별 동작 실행
+
+현재 대부분의 VLA는 이 구조 없이 단일 정책만 사용 → Medium-horizon(1분) 이상은 초기 단계.
+
+### 현실과의 격차
+
+| 일상 작업 | 소요 시간 | 현재 VLA 가능 여부 |
+|-----------|-----------|-------------------|
+| 사과 깎기 | 1~2분 | 겨우 시작 (MoDE-VLA) |
+| 커피 만들기 | 3~5분 | 불가능 |
+| 설거지 | 5~10분 | 불가능 |
+| 요리 한 끼 | 30분+ | 매우 먼 미래 |
 
 ## 메모
 (스터디하면서 추가)

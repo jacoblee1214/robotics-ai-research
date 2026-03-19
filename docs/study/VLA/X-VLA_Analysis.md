@@ -173,78 +173,110 @@ Step 2: Joint Policy Adaptation
 
 ---
 
-## 5. 코드 구조 (GitHub)
+## 5. 코드 구조 (실제 확인 기준, 2026-03-19)
+
+X-VLA는 두 가지 형태로 존재하며, **역할이 다르므로 둘 다 사용**:
+
+### 5.1 독립 레포 (`~/X-VLA/`) — 시뮬레이션 eval / LoRA / 배포용
 
 ```
 X-VLA/
-├── xvla/
-│   ├── model/
-│   │   ├── xvla_model.py          # ★ X-VLA 모델 정의
-│   │   ├── soft_prompt.py         # ★ Soft Prompt 구현
-│   │   ├── florence_encoder.py    # Florence VLM 인코더
-│   │   └── flow_matching.py       # Flow matching 학습/추론
-│   │
-│   ├── data/
-│   │   ├── dataset.py             # 데이터 로딩
-│   │   └── preprocessing.py       # Action alignment, temporal downsampling
-│   │
-│   └── configs/
-│       └── *.yaml                 # 학습/추론 설정
+├── models/
+│   ├── modeling_xvla.py       # ★ FastAPI 서버 기반 XVLA 클래스 (배포용)
+│   ├── modeling_florence2.py  # Florence2 VLM
+│   ├── transformer.py         # SoftPromptedTransformer
+│   ├── action_hub.py          # Action space 정의
+│   ├── configuration_xvla.py
+│   └── configuration_florence2.py
 │
-├── scripts/
-│   ├── train.py                   # 학습 스크립트
-│   ├── eval.py                    # 평가 스크립트
-│   └── deploy.py                  # 배포 스크립트
+├── datasets/
+│   ├── dataset.py             # 데이터 로딩
+│   ├── domain_config.py       # 도메인별 설정
+│   └── domain_handler/        # Droid, RoboMind, AGIBOT, LeRobot 등 핸들러
 │
-└── examples/                      # 벤치마크별 설정
+├── evaluation/                # ★ 시뮬레이션 벤치마크 eval (여기만 있음)
+│   ├── libero/                # LIBERO eval 클라이언트
+│   ├── calvin/                # CALVIN eval 클라이언트
+│   ├── simpler/               # SimplerEnv
+│   ├── vlabench/
+│   ├── robotwin-2.0/
+│   └── SoftFold-Agilex/
+│
+├── train.py                   # 독자 학습 스크립트
+├── peft_train.py              # ★ LoRA fine-tuning 스크립트
+├── deploy.py                  # 실제 로봇 배포 (FastAPI server-client)
+├── environment.yml            # 독립 conda 환경
+└── requirements.txt
 ```
 
-### LeRobot 통합
+**핵심:** `modeling_xvla.py`가 `FastAPI` 기반 서버로 구현됨 → 실제 로봇과 분리된 server-client 구조.
 
-X-VLA는 LeRobot에 네이티브 통합되어 있어서 LeRobot CLI로도 사용 가능:
+### 5.2 LeRobot 통합 (`~/lerobot/src/lerobot/policies/xvla/`) — 학습/추론 파이프라인용
 
-```bash
-# LeRobot에서 X-VLA 학습
-python -m lerobot.scripts.lerobot_train \
-  --policy.type=xvla \
-  --dataset.repo_id=<DATASET> \
-  ...
 ```
+lerobot/src/lerobot/policies/xvla/
+├── modeling_xvla.py       # ★ PreTrainedPolicy 기반 (lerobot 표준 인터페이스)
+├── soft_transformer.py    # ★ Soft Prompt + Transformer 구현
+├── modeling_florence2.py  # Florence2 VLM
+├── action_hub.py          # Action space 정의
+├── processor_xvla.py      # 데이터 전처리
+├── configuration_xvla.py
+├── configuration_florence2.py
+└── utils.py
+```
+
+**핵심:** SmolVLA와 동일한 `PreTrainedPolicy` 인터페이스 → lerobot CLI로 바로 사용 가능.
+
+### 5.3 두 레포 역할 분담
+
+| 목적 | 어디서 |
+|------|--------|
+| 코드 구조 분석 / SmolVLA와 비교 | lerobot xvla |
+| lerobot 데이터셋으로 fine-tuning | lerobot xvla |
+| LIBERO / CALVIN 시뮬레이션 eval | 독립 X-VLA 레포 (`evaluation/`) |
+| LoRA fine-tuning | 독립 X-VLA 레포 (`peft_train.py`) |
+| 실제 로봇 배포 | 독립 X-VLA 레포 (`deploy.py`) |
 
 ---
 
 ## 6. 실행 방법
 
-### 6.1 Server-Client 구조 (독립 레포 사용 시)
+### 6.1 LeRobot 통합 사용 시 (fine-tuning)
 
 ```bash
-# Server (GPU)
-python scripts/server.py \
-  --model-path 2toINF/X-VLA-Pt \
-  --device cuda:0
-
-# Client (로봇)
-python scripts/client.py \
-  --server-address localhost:5555
-```
-
-### 6.2 LeRobot 통합 사용 시
-
-```bash
-# Fine-tuning
 python -m lerobot.scripts.lerobot_train \
   --policy.type=xvla \
   --policy.path=2toINF/X-VLA-Pt \
   --dataset.repo_id=lerobot/svla_so100_pickplace \
   --output_dir=outputs/xvla_train
+```
 
-# LoRA fine-tuning (추정)
-python -m lerobot.scripts.lerobot_train \
-  --policy.type=xvla \
-  --policy.path=2toINF/X-VLA-Pt \
-  --peft.method_type=lora \
-  --peft.r=16 \
+### 6.2 독립 레포 — LoRA fine-tuning
+
+```bash
+# peft_train.py 사용
+python peft_train.py \
+  --model-path 2toINF/X-VLA-Pt \
   ...
+```
+
+### 6.3 독립 레포 — 시뮬레이션 eval (LIBERO 예시)
+
+```bash
+# evaluation/libero/ 참고
+python evaluation/libero/libero_client.py \
+  --model-path 2toINF/X-VLA-Pt \
+  ...
+```
+
+### 6.4 독립 레포 — 실제 로봇 배포 (FastAPI server-client)
+
+```bash
+# Server (GPU 머신)
+python deploy.py --model-path 2toINF/X-VLA-Pt --device cuda:0
+
+# Client (로봇 측)
+# HTTP로 서버와 통신
 ```
 
 ---
@@ -299,14 +331,336 @@ Fixed camera와 wrist camera를 분리하는 설계:
 
 ---
 
-## 9. 스터디 체크리스트
+## 9. `soft_transformer.py` 코드 분석 (lerobot 버전)
 
-- [ ] X-VLA 레포 fork & clone
+### 9.1 클래스 구조
+
+```
+SoftPromptedTransformer
+├── DomainAwareLinear (action_encoder)   — 도메인별 action 임베딩
+├── DomainAwareLinear (action_decoder)   — 도메인별 action 디코딩
+├── vlm_proj          (Linear 또는 DomainAwareLinear) — VLM feature 투영
+├── aux_visual_proj   (Linear 또는 DomainAwareLinear) — wrist camera 투영
+├── soft_prompt_hub   (nn.Embedding)     — ★ 도메인별 learnable soft prompt
+├── TransformerBlock x N                — standard SA only (bidirectional)
+└── pos_emb           (nn.Parameter)    — learnable positional embedding
+```
+
+### 9.2 핵심 1 — `DomainAwareLinear`
+
+cross-embodiment의 실제 구현. 일반 `nn.Linear` 대신 `nn.Embedding`으로 **로봇마다 별도 weight matrix**를 저장:
+
+```python
+class DomainAwareLinear(nn.Module):
+    def __init__(self, input_size, output_size, num_domains=20):
+        self.fc   = nn.Embedding(num_domains, output_size * input_size)  # 도메인별 weight
+        self.bias = nn.Embedding(num_domains, output_size)               # 도메인별 bias
+```
+
+`forward` 시 `domain_id`로 해당 로봇의 weight를 꺼내서 matmul.
+→ action space가 로봇마다 달라도 각자 맞는 weight로 처리 가능.
+
+`action_encoder` / `action_decoder` 둘 다 `DomainAwareLinear` → 입력/출력 모두 도메인별로 적응.
+
+### 9.3 핵심 2 — `soft_prompt_hub`
+
+```python
+self.soft_prompt_hub = nn.Embedding(num_domains, len_soft_prompts * hidden_size)
+```
+
+`domain_id`로 로봇별 learnable token 묶음을 꺼내서 시퀀스 **끝에 append**:
+
+```
+[action tokens | VLM tokens | wrist tokens] + pos_emb
+→ append → [... | soft prompt tokens]
+→ Transformer blocks (bidirectional SA)
+→ 앞 num_actions 개만 decode → action 출력
+```
+
+Soft prompt가 끝에 붙어도 bidirectional attention이라 앞의 action 토큰들이 soft prompt를 attend 가능.
+→ "이 로봇은 이런 하드웨어 특성이 있다"는 도메인 정보를 action 토큰이 참조하는 구조.
+
+### 9.4 `forward()` 전체 흐름
+
+```python
+# 1. action + proprio + timestep → 하나의 토큰으로 합침
+time_emb      = sinusoidal_embedding(t)                          # [B, dim_time]
+time_tokens   = time_emb.expand(B, num_actions, ...)             # 모든 action에 동일 timestep
+action_tokens = concat([noisy_action, proprio, time_tokens])     # [B, N_act, dim_a+dim_p+dim_t]
+x = action_encoder(action_tokens, domain_id)                     # DomainAwareLinear → [B, N_act, H]
+
+# 2. 시각 정보 concat
+x = concat([x, vlm_proj(vlm_features), aux_visual_proj(wrist_features)])  # [B, N_total, H]
+
+# 3. 위치 임베딩
+x = x + pos_emb[:, :seq_len]
+
+# 4. soft prompt append
+soft_prompts = soft_prompt_hub(domain_id).view(B, len_soft_prompts, H)
+x = concat([x, soft_prompts])                                    # [B, N_total + len_prompts, H]
+
+# 5. Transformer (SA only, bidirectional, causal mask 없음)
+for block in blocks:
+    x = block(x)
+
+# 6. 앞 num_actions 개만 decode
+return action_decoder(norm(x[:, :num_actions]), domain_id)
+```
+
+### 9.5 SmolVLA와 핵심 구조 비교
+
+| | SmolVLA | X-VLA |
+|---|---------|-------|
+| Attention | CA+SA interleaved | SA only (bidirectional) |
+| 도메인 적응 | rename_map (수동) | DomainAwareLinear + Soft Prompt |
+| VLM features 참조 방식 | Cross-Attention | 시퀀스에 concat 후 SA |
+| Action 토큰 위치 | suffix (VLM 뒤) | prefix (시퀀스 앞) |
+| Soft prompt 위치 | 없음 | 시퀀스 끝에 append |
+| 시간 정보 주입 | sinusoidal → MLP fusion | sinusoidal → action 토큰에 concat |
+| Action 디코딩 | `nn.Linear` (action_out_proj) | `DomainAwareLinear` |
+| Causal mask | ✅ (action chunk 내부) | ❌ (완전 bidirectional) |
+
+---
+
+## 10. `modeling_xvla.py` 코드 분석
+
+### 10.1 클래스 구조
+
+```
+XVLAPolicy (PreTrainedPolicy — lerobot 인터페이스)
+  └── XVLAModel
+        ├── vlm (Florence2, encoder-only)
+        │    ├── vision_tower          (이미지 인코딩)
+        │    └── language_model.encoder (텍스트+이미지 fusion)
+        │         ※ decoder, lm_head는 __init__에서 삭제됨
+        └── transformer (SoftPromptedTransformer)
+```
+
+### 10.2 Florence-2를 encoder-only로 사용
+
+```python
+del lm.model.decoder
+del lm.lm_head
+```
+
+Florence-2는 원래 encoder-decoder 구조지만 **decoder와 lm_head를 삭제**하고 encoder만 사용.
+텍스트 생성이 목적이 아니라 이미지+텍스트의 fused feature를 뽑는 게 목적이라서.
+
+### 10.3 `forward_vlm()` — 카메라 역할 분리
+
+```python
+# view[0] → Florence-2 encoder에서 텍스트와 merge → vlm_features
+merged_embeds = vlm._merge_input_ids_with_image_features(image_features[:, 0], text_embeds)
+enc_out = vlm.language_model.model.encoder(merged_embeds)   # vlm_features
+
+# view[1:] → 그대로 aux_visual_inputs (wrist camera 등)
+aux_visual_inputs = image_features[:, 1:].reshape(B, -1, hidden_dim)
+```
+
+- **view[0]** (fixed cam): Florence-2 encoder에서 텍스트와 통합 → high-level reasoning
+- **view[1:]** (wrist cam): VLM 없이 바로 Transformer에 전달 → fine-grained manipulation
+
+### 10.4 Flow Matching — SmolVLA와 구현 방식이 다름
+
+**학습 시 (`forward`):**
+
+```python
+# Stratified timestep 샘플링 (배치 내 균등 커버리지 보장)
+t = (rand(1) + arange(batch_size) / batch_size) % (1 - 1e-5)
+
+# noisy action (SmolVLA와 동일한 interpolation)
+action_noisy = noise * t + action * (1 - t)
+
+# 예측 target: clean action 직접 예측
+pred_action = transformer(action_noisy, t, ...)
+loss = compute_loss(pred_action, action)   # GT clean action과 비교
+```
+
+**추론 시 (`generate_actions`):**
+
+```python
+x1 = randn(...)    # 순수 노이즈
+action = zeros(...)
+
+for i in range(steps, 0, -1):    # t: 1.0 → 1/steps
+    t = i / steps
+    x_t = x1 * t + action * (1-t)   # 현재 action 추정으로 재보간
+    action = transformer(x_t, t, ...)  # clean action 직접 예측 → 다음 반복에 사용
+```
+
+**SmolVLA와 핵심 차이:**
+
+| | SmolVLA | X-VLA |
+|---|---------|-------|
+| 예측 target | velocity (`noise - action`) | clean action 직접 |
+| 추론 방식 | Euler 적분 (`x += dt * v`) | 직접 예측 후 재보간 |
+| timestep 샘플링 | Beta(1.5, 1.0) | Stratified (균등 커버리지) |
+| denoising steps | 10 (고정) | config (`num_denoising_steps`) |
+
+X-VLA는 velocity가 아닌 **clean action을 직접 예측**. 매 step마다 현재 clean 추정값으로 재보간해서 노이즈를 점진적으로 줄여가는 방식.
+
+### 10.5 Fine-tuning 유연성 (`_apply_freezing`)
+
+SmolVLA의 `train_expert_only` 하나와 달리 4가지를 독립 제어:
+
+| config 옵션 | 대상 |
+|---|---|
+| `freeze_vision_encoder` | Florence-2 vision tower |
+| `freeze_language_encoder` | Florence-2 language encoder |
+| `train_policy_transformer` | SoftPromptedTransformer 전체 |
+| `train_soft_prompts` | soft prompt만 독립 학습 |
+
+조합 예시:
+- soft prompt만 학습 → Prompt Warm-up (Phase I, 새 로봇 적응 1단계)
+- transformer + soft prompt 학습 → full fine-tuning (Phase II)
+- LoRA 적용 → transformer 내부 일부만 학습 (peft_train.py)
+
+또한 `get_optim_params()`에서 VLM 컴포넌트에 **1/10 LR** 적용 → pretrained 표현 보존.
+
+### 10.6 Cross-embodiment Padding
+
+```python
+pad_vector(state, max_state_dim)           # 로봇마다 다른 state dim → max로 zero-padding
+pad_tensor_along_dim(action, chunk_size)   # action chunk도 동일하게 패딩
+```
+
+action/state 차원이 달라도 `max_action_dim`으로 zero-padding 후 `DomainAwareLinear`가 domain별로 맞게 처리. 하나의 모델이 다양한 로봇을 수용하는 구조의 핵심.
+
+---
+
+## 11. 나머지 파일 역할 요약
+
+### `modeling_florence2.py`
+Microsoft Florence-2 모델의 PyTorch 구현. X-VLA가 외부 의존성 없이 자체 포함하기 위해 코드를 직접 가져온 것. 내부 구조는 DaViT(vision encoder) + BART-style language encoder로 구성된 표준 Florence-2 그대로. X-VLA는 이 중 **encoder만 사용**하고 decoder/lm_head는 삭제함 (10.2 참고). Florence-2 자체를 깊이 공부하려면 별도로 보면 됨.
+
+### `action_hub.py`
+로봇별 action space를 등록/관리하는 레지스트리. 각 action space는 `preprocess` (action → 모델 입력 정규화), `compute_loss` (예측 vs GT), `postprocess` (모델 출력 → 실제 action) 를 정의함.
+
+등록된 action space:
+
+| 이름 | 대상 로봇 |
+|------|---------|
+| `ee6d` | EEF 6D (xyz + Rotate6D + gripper) — 표준 |
+| `joint` | Joint angle 기반 |
+| `agibot_ee6d` | AGIBOT 로봇 특화 |
+| `franka_joint7` | Franka 7-DoF joint |
+| `auto` | 데이터셋 action dim을 자동 감지 |
+| `so101_bimanual` | SO101 양팔 로봇 |
+
+`auto` 모드는 데이터셋의 실제 action dim을 읽어서 자동으로 action space를 설정 → fine-tuning 시 별도 설정 없이 바로 사용 가능.
+
+### `processor_xvla.py`
+이미지/텍스트 전처리 담당. 이미지 리사이즈/정규화, 텍스트 토크나이징을 Florence-2 입력 형식에 맞게 처리.
+
+### `configuration_xvla.py` / `configuration_florence2.py`
+모델 하이퍼파라미터 정의 (`hidden_size`, `depth`, `num_heads`, `num_domains`, `len_soft_prompts` 등). `from_pretrained` 시 자동으로 로드됨.
+
+---
+
+## 12. lerobot Fine-tuning 설정 기록
+
+### 12.1 config.json 호환성 수정
+
+HuggingFace에서 다운로드한 `pretrained/xvla_pt/config.json`은 lerobot의 draccus 파싱 시스템과 호환되지 않아 수동 수정 필요.
+
+**제거한 필드** (HF 전용, XVLAConfig에 없음):
+- `_name_or_path`, `model_type`, `architectures`, `auto_map`, `num_actions`, `soft_prompt_length`
+
+**추가/수정한 필드**:
+- `"type": "xvla"` — draccus가 policy type 식별에 필수
+- `"max_action_dim": 30` — pretrained weight shape에서 역산
+- `"max_state_dim": 20` — weight shape 역산: 73728/1024=72, 72-20(ee6d)-32(dim_time)=20
+
+### 12.2 weight 로딩 수정 (`modeling_xvla.py`)
+
+pretrained weight의 키가 `model.` prefix 없이 저장되어 있어서 `from_pretrained` 시 mismatch 발생.
+
+**Fix 1** — prefix 추가:
+```python
+sample_key = next(iter(state_dict))
+if not sample_key.startswith("model."):
+    state_dict = {"model." + k: v for k, v in state_dict.items()}
+```
+
+**Fix 2** — embed_tokens/shared 양방향 복사:
+```python
+if encoder_key in state_dict and shared_key not in state_dict:
+    state_dict[shared_key] = state_dict[encoder_key]
+elif shared_key in state_dict and encoder_key not in state_dict:
+    state_dict[encoder_key] = state_dict[shared_key]
+```
+
+### 12.3 processor 파일 생성
+
+lerobot은 pretrained path에 `policy_preprocessor.json` / `policy_postprocessor.json`이 있어야 함. HuggingFace pretrained 모델에는 이 파일이 없으므로 수동 생성.
+
+**preprocessor 단계 순서:**
+1. `rename_observations_processor` — observation key rename
+2. `to_batch_processor` — batch dim 추가
+3. `tokenizer_processor` — BART tokenizer (`facebook/bart-large`, max_length=64)
+4. `xvla_image_to_float` — [0,255] → [0,1]
+5. `xvla_imagenet_normalize` — ImageNet mean/std 정규화
+6. `xvla_add_domain_id` — domain_id 텐서 추가
+7. `device_processor` — GPU 이동
+8. `normalizer_processor` — stats는 학습 시 dataset stats로 override됨
+
+**postprocessor 단계:**
+1. `unnormalizer_processor`
+2. `device_processor` (cpu)
+
+### 12.4 이미지 리사이즈 필요
+
+데이터셋 이미지: **480×640** (non-square)
+
+Florence-2 DaViT backbone은 feature map이 정사각형이어야 함 (`assert h * w == num_tokens`). 480×640 → 15×20 feature map → assertion 실패.
+
+**해결**: `--policy.resize_imgs_with_padding="[224,224]"`
+- 224×224 입력 → DaViT stride [4,2,2,2] → **7×7=49 tokens** (√49=7 ✓)
+- config `max_pos_embeddings: 50` 범위 내
+
+### 12.5 최종 학습 커맨드
+
+```bash
+cd /home/jake/lerobot/src && PYTORCH_ALLOC_CONF=expandable_segments:True \
+conda run -n smolvla python -m lerobot.scripts.lerobot_train \
+  --policy.path=pretrained/xvla_pt \
+  --dataset.repo_id=lerobot/svla_so100_pickplace \
+  --output_dir=outputs/xvla_train_100k \
+  --policy.push_to_hub=false \
+  --job_name=xvla_finetune \
+  --steps=100000 \
+  --batch_size=8 \
+  --policy.dtype=bfloat16 \
+  --policy.freeze_vision_encoder=true \
+  --policy.freeze_language_encoder=true \
+  --policy.resize_imgs_with_padding="[224,224]"
+```
+
+**메모리 설정 근거 (RTX 5070 Ti 12GB):**
+- `dtype=bfloat16` — 모델 전체 bf16 (~50% 절감)
+- `freeze_vision_encoder + freeze_language_encoder` — Florence-2 gradient 없음, 311M만 학습
+- 결과: 6.3GB VRAM 사용, GPU 94% 활용, ~3.5 step/s
+
+**SmolVLA 비교 조건:**
+- 동일 데이터셋: `lerobot/svla_so100_pickplace` (50 episodes, 19,631 frames)
+- 동일 steps: 100K
+- 동일 batch_size: 8 (총 ~40 epoch)
+- 예상 학습 시간: ~8시간
+
+---
+
+## 13. 스터디 체크리스트
+
+- [x] X-VLA 레포 fork & clone (`~/X-VLA/`)
+- [x] lerobot 내 xvla 통합 확인 (`lerobot/src/lerobot/policies/xvla/`)
+- [x] 두 레포 역할 분담 파악 (Section 5.3 참고)
+- [x] `soft_transformer.py` 코드 분석 (Section 9)
+- [x] `modeling_xvla.py` 코드 분석 (Section 10)
+- [x] 나머지 파일 역할 파악 (`modeling_florence2.py`, `action_hub.py` 등, Section 11)
+- [x] lerobot fine-tuning 환경 설정 (config 호환성, processor, 이미지 리사이즈, Section 12)
+- [x] lerobot fine-tuning 실험 시작 (so100_pickplace 100K steps, 현재 학습 중)
 - [ ] 논문 Figure 2 (heterogeneity 해결 방법 비교) 이해
-- [ ] Soft Prompt 코드 확인 (soft_prompt.py)
-- [ ] Florence-Large VLM 구조 이해
-- [ ] Flow matching 구현 비교 (SmolVLA vs X-VLA)
-- [ ] LeRobot 통합 사용법 테스트
-- [ ] LoRA fine-tuning 실험
-- [ ] SmolVLA와 같은 데이터셋으로 성능 비교
+- [ ] 학습 결과 분석 및 SmolVLA와 성능 비교
+- [ ] LoRA fine-tuning 실험 (`peft_train.py`)
+- [ ] LIBERO 시뮬레이션 eval 환경 설치 및 실행
 - [ ] Soft Prompt embedding 시각화/분석
