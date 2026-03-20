@@ -649,26 +649,94 @@ conda run -n smolvla python -m lerobot.scripts.lerobot_train \
 
 ---
 
-## 13. lerobot Fine-tuning 결과 분석 (100K steps)
+## 13. lerobot Fine-tuning 결과 분석
 
-### 13.1 추론 결과 (xvla_infer.py, 9개 프레임)
+### 13.0 실험 이력 요약
+
+| 실험 | 설정 | 결과 |
+|------|------|------|
+| Run 1: 100K steps (실패) | `pretrained/xvla_pt` + IDENTITY 정규화 | 완전 Mode Collapse |
+| Run 2: 20K steps (개선) | `lerobot/xvla-base` + MEAN_STD + action_mode=auto | Home Position Collapse |
+
+---
+
+### 13.1 Run 1 — 추론 결과 (100K steps, 실패)
 
 ```
 Frame   0  | Mean Error: 77.26  | Predicted: [12.125, 13.0, 13.125, 13.25, 13.125, 7.969]
 Frame  50  | Mean Error: 77.22  | Predicted: [12.125, 13.0, 13.125, 13.25, 13.125, 7.969]  ← 동일
 Frame 100  | Mean Error: 59.79  | Predicted: [12.125, 13.0, 13.125, 13.25, 13.125, 7.969]  ← 동일
-...
 Frame 400  | Mean Error: 78.65  | Predicted: [12.125, 13.0, 13.125, 13.25, 13.125, 7.969]  ← 동일
 ```
 
 **9개 프레임 전부 동일한 값 출력 → 완전한 Mode Collapse.**
 예측값 `[12.125, 13.0, ...]`은 실제 home position(`[0.6, 177, 164, 72, 82, 0.1]`)과도 무관.
+Training loss: step 2K = 6,242,631 / step 100K = 6,275,072 → **100K 동안 loss 변화 없음**
 
-SmolVLA 비교:
-- SmolVLA: home position collapse (Frame 0/400 에러 ~2 이하, 적어도 home에 수렴)
-- X-VLA: 의미없는 고정값, 에러 56~81
+### 13.2 Run 2 — 추론 결과 (20K steps, lerobot/xvla-base)
 
-### 13.2 학습 실패 원인 분석
+**학습 설정:**
+```
+pretrained: lerobot/xvla-base (HF 공식)
+steps: 20,000
+batch_size: 4, bfloat16
+action_mode: auto (SO-100 6DoF 자동 감지)
+freeze: false (전체 879M 학습)
+rename_map: top→image, wrist→image2
+최종 loss: 0.012  ←  Run 1 대비 약 5억 배 개선
+```
+
+**추론 결과:**
+```
+Frame   0  | Pred: [0.375, 178.0, 165.0, 72.5, 82.5, 0.0625]  | Mean Error:  0.28
+Frame  50  | Pred: [0.375, 178.0, 165.0, 72.5, 82.0, 0.0625]  | Mean Error:  0.39
+Frame 100  | Pred: [0.375, 178.0, 165.0, 72.5, 82.0, 0.0625]  | Mean Error: 18.04
+Frame 150  | Pred: [0.375, 178.0, 165.0, 72.5, 82.0, 0.0625]  | Mean Error: 29.99  ← 피크
+Frame 200  | Pred: [0.375, 178.0, 165.0, 72.0, 82.0, 0.0625]  | Mean Error: 22.14
+Frame 250  | Pred: [0.375, 178.0, 165.0, 72.0, 82.0, 0.0625]  | Mean Error: 20.70
+Frame 300  | Pred: [0.375, 178.0, 164.0, 72.0, 82.0, 0.0625]  | Mean Error: 17.37
+Frame 350  | Pred: [0.375, 178.0, 164.0, 72.0, 82.0, 0.0625]  | Mean Error: 12.81
+Frame 400  | Pred: [0.25,  178.0, 164.0, 72.0, 82.0, 0.0625]  | Mean Error:  2.67
+```
+
+**에러 패턴 (bell-shape):**
+```
+ Frame:   0    50   100   150   200   250   300   350   400
+ Error: 0.28  0.39  18.0  30.0  22.1  20.7  17.4  12.8  2.67
+          ↑                 ↑                              ↑
+        home 시작        task 중간 (피크)             home 복귀
+```
+
+**진단: Home Position Collapse (Mode Collapse와 다름)**
+- Mode Collapse(Run 1): 모든 프레임에 의미없는 고정값 출력
+- Home Position Collapse(Run 2): home 자세(평균)를 외워서 모든 프레임에 출력
+- Run 2는 task 중간 프레임(100~350)에서 큰 에러 → 실제 task 동작을 학습하지 못함
+- Frame 0, 400은 실제로 home 자세 → 우연히 에러가 낮음
+
+이 패턴은 **SmolVLA fine-tuning 결과와 동일** (SmolVLA_Analysis.md Section 12.4 참고)
+
+---
+
+### 13.3 Run 1 vs Run 2 비교
+
+| 항목 | Run 1 (100K, 실패) | Run 2 (20K, 개선) |
+|------|-------------------|------------------|
+| pretrained | `pretrained/xvla_pt` | `lerobot/xvla-base` ✓ |
+| action 정규화 | IDENTITY ✗ | MEAN_STD ✓ |
+| action_mode | 미설정 | auto ✓ |
+| 학습 가능 파라미터 | 311M | 879M |
+| 최종 loss | 6,275,072 | **0.012** |
+| 붕괴 유형 | 완전 Mode Collapse | Home Position Collapse |
+| Frame 0 에러 | 77.26 | **0.28** |
+| Frame 150 에러 | ~60 | 29.99 |
+| Frame 400 에러 | 78.65 | **2.67** |
+
+**결론: MEAN_STD 정규화 수정만으로 loss가 정상 수렴. 학습 자체는 성공.**
+**남은 문제는 Home Position Collapse — 데이터/스텝 부족 문제.**
+
+---
+
+### 13.4 학습 실패 원인 분석 (Run 1)
 
 **[원인 1: ACTION 정규화 미적용 — 가장 결정적]**
 
@@ -726,7 +794,7 @@ freeze_vision_encoder=true + freeze_language_encoder=true
 - 879M 모델 × 50 에피소드: SmolVLA(450M)보다 파라미터/데이터 비율이 더 불리
 - X-VLA 논문의 fine-tuning은 충분한 태스크 데이터 가정
 
-### 13.3 SmolVLA vs X-VLA 비교
+### 13.5 SmolVLA vs X-VLA 비교
 
 | 항목 | SmolVLA | X-VLA |
 |------|---------|-------|
@@ -738,27 +806,34 @@ freeze_vision_encoder=true + freeze_language_encoder=true
 | Mode collapse | home position 수렴 | 무의미한 고정값 |
 | Frame 0 에러 | 0.14 | 77.26 |
 
-### 13.4 제대로 학습하려면 (워크스테이션 환경 기준)
+### 13.6 Home Position Collapse 해결 방안
 
-**노트북(12GB)에서도 가능한 수정:**
+Run 2에서 Home Position Collapse가 발생한 원인과 해결 방향:
 
-| 수정 사항 | 이유 |
-|----------|------|
-| `ACTION: MEAN_STD` 정규화 | loss 스케일 정상화 — **최우선, 반드시 필요** |
-| encoder 동결 유지 가능 | 사전학습 피처 재활용, VRAM 절감 |
+**원인:**
+- 879M 파라미터 모델 × 50 에피소드 × 20K steps = 데이터/스텝 부족
+- SmolVLA(450M)도 동일 조건에서 같은 패턴 → X-VLA 고유 문제가 아닌 데이터 규모 문제
+- 에피소드 구조: home→task→home → 전체 프레임의 상당 비율이 home 자세 → 모델이 평균을 외움
+
+**노트북(12GB)에서 가능한 개선:**
+
+| 개선 방향 | 기대 효과 |
+|----------|----------|
+| steps 100K+ 로 증가 | 더 많은 학습 → task 중간 동작 학습 가능성 |
+| 에피소드 수 100~200개로 증가 | 데이터 다양성 확보 |
+| **둘 다 적용** | 가장 효과적 |
 
 **워크스테이션(96GB)에서 추가 가능:**
 
-| 수정 사항 | 이유 |
-|----------|------|
-| encoder freeze 해제 | SO-100 완전 도메인 적응 |
+| 개선 방향 | 기대 효과 |
+|----------|----------|
 | 원본 해상도 480×640 유지 | pre-training 분포 유지 |
 | batch_size 32+ | gradient 안정화 |
-| 에피소드 수 200+ | 파라미터/데이터 비율 개선 |
+| 에피소드 500+ | X-VLA 논문 수준 데이터 규모 |
 
-→ **X-VLA 논문의 성능은 실제로 좋다. 이번 실패의 핵심은 ACTION: IDENTITY 설정 오류 하나이며, MEAN_STD로만 바꿔도 노트북에서도 유의미한 결과가 나올 가능성이 있다.**
+→ **Run 1 실패는 IDENTITY 정규화 단 하나의 오류였음. Run 2에서 학습 자체는 정상 확인. 이제 데이터/스텝 규모 문제만 남음.**
 
-### 13.5 공식 lerobot 문서와의 차이 (근본 원인)
+### 13.7 공식 lerobot 문서와의 차이 (Run 1 근본 원인)
 
 참고: https://huggingface.co/docs/lerobot/xvla
 
@@ -777,8 +852,9 @@ freeze_vision_encoder=true + freeze_language_encoder=true
 - SO-100은 6 DOF인데 기본 action_mode에서 차원 불일치 발생 가능
 - `auto` 모드: dataset의 실제 action 차원 감지 + loss를 real_dim에만 계산
 
-### 13.6 올바른 재실험 커맨드
+### 13.8 다음 실험 커맨드
 
+Run 2 커맨드 (기준, 완료):
 ```bash
 cd /home/jake/lerobot/src && PYTORCH_ALLOC_CONF=expandable_segments:True \
 conda run -n smolvla python -u -m lerobot.scripts.lerobot_train \
@@ -795,10 +871,31 @@ conda run -n smolvla python -u -m lerobot.scripts.lerobot_train \
   --policy.freeze_language_encoder=false \
   --policy.train_policy_transformer=true \
   --policy.train_soft_prompts=true \
-  --policy.resize_imgs_with_padding="[224,224]"
+  --policy.resize_imgs_with_padding="[224,224]" \
+  --rename_map='{"observation.images.top": "observation.images.image", "observation.images.wrist": "observation.images.image2"}'
 ```
 
-OOM 발생 시: `--policy.freeze_vision_encoder=true --policy.freeze_language_encoder=true --batch_size=2`
+Run 3 예정 (steps + 데이터 확대):
+```bash
+# steps=100000, 에피소드 수 100~200개 수집 후
+cd /home/jake/lerobot/src && PYTORCH_ALLOC_CONF=expandable_segments:True \
+conda run -n smolvla python -u -m lerobot.scripts.lerobot_train \
+  --policy.path=lerobot/xvla-base \
+  --dataset.repo_id=<새 데이터셋 repo_id> \
+  --output_dir=outputs/xvla_100k_v2 \
+  --policy.push_to_hub=false \
+  --job_name=xvla_100k_v2 \
+  --steps=100000 \
+  --batch_size=4 \
+  --policy.dtype=bfloat16 \
+  --policy.action_mode=auto \
+  --policy.freeze_vision_encoder=false \
+  --policy.freeze_language_encoder=false \
+  --policy.train_policy_transformer=true \
+  --policy.train_soft_prompts=true \
+  --policy.resize_imgs_with_padding="[224,224]" \
+  --rename_map='{"observation.images.top": "observation.images.image", "observation.images.wrist": "observation.images.image2"}'
+```
 
 ---
 
@@ -811,8 +908,9 @@ OOM 발생 시: `--policy.freeze_vision_encoder=true --policy.freeze_language_en
 - [x] `modeling_xvla.py` 코드 분석 (Section 10)
 - [x] 나머지 파일 역할 파악 (`modeling_florence2.py`, `action_hub.py` 등, Section 11)
 - [x] lerobot fine-tuning 환경 설정 (config 호환성, processor, 이미지 리사이즈, Section 12)
-- [x] lerobot fine-tuning 실험 시작 (so100_pickplace 100K steps, 현재 학습 중)
-- [x] 학습 결과 분석 및 SmolVLA와 성능 비교 (Section 13 — 학습 실패, 원인 분석 완료)
+- [x] lerobot fine-tuning 실험 시작 (so100_pickplace 100K steps → 실패, 원인 분석)
+- [x] lerobot/xvla-base + MEAN_STD + action_mode=auto 로 재실험 (20K steps, Run 2)
+- [x] Run 2 결과 분석 — loss 0.012 수렴, Home Position Collapse 확인 (Section 13)
 - [ ] 논문 Figure 2 (heterogeneity 해결 방법 비교) 이해
 - [ ] LoRA fine-tuning 실험 (`peft_train.py`)
 - [ ] LIBERO 시뮬레이션 eval 환경 설치 및 실행
