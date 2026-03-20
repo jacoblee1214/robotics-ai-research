@@ -649,7 +649,160 @@ conda run -n smolvla python -m lerobot.scripts.lerobot_train \
 
 ---
 
-## 13. 스터디 체크리스트
+## 13. lerobot Fine-tuning 결과 분석 (100K steps)
+
+### 13.1 추론 결과 (xvla_infer.py, 9개 프레임)
+
+```
+Frame   0  | Mean Error: 77.26  | Predicted: [12.125, 13.0, 13.125, 13.25, 13.125, 7.969]
+Frame  50  | Mean Error: 77.22  | Predicted: [12.125, 13.0, 13.125, 13.25, 13.125, 7.969]  ← 동일
+Frame 100  | Mean Error: 59.79  | Predicted: [12.125, 13.0, 13.125, 13.25, 13.125, 7.969]  ← 동일
+...
+Frame 400  | Mean Error: 78.65  | Predicted: [12.125, 13.0, 13.125, 13.25, 13.125, 7.969]  ← 동일
+```
+
+**9개 프레임 전부 동일한 값 출력 → 완전한 Mode Collapse.**
+예측값 `[12.125, 13.0, ...]`은 실제 home position(`[0.6, 177, 164, 72, 82, 0.1]`)과도 무관.
+
+SmolVLA 비교:
+- SmolVLA: home position collapse (Frame 0/400 에러 ~2 이하, 적어도 home에 수렴)
+- X-VLA: 의미없는 고정값, 에러 56~81
+
+### 13.2 학습 실패 원인 분석
+
+**[원인 1: ACTION 정규화 미적용 — 가장 결정적]**
+
+```
+SmolVLA preprocessor: ACTION: MEAN_STD  → action을 평균 0, 표준편차 1로 정규화
+X-VLA preprocessor:   ACTION: IDENTITY  → raw degree 값 그대로 사용
+```
+
+X-VLA 데이터셋 action 통계 (학습 중 계산됐지만 IDENTITY라 미사용):
+- mean: `[14.5, 146.4, 143.3, 62.9, 85.8, 7.8]`
+- std:  `[27.9, 34.9, 21.4, 16.9, 12.4, 9.5]`
+
+Flow Matching 손실: `u_t = noise - action` (noise ~N(0,1), action ~0~180°)
+→ `u_t` 스케일이 수십~수백 → MSE loss 수백만
+→ 실제: step 2K = 6,242,631 / step 100K = 6,275,072 → **100K 스텝 동안 loss 변화 없음**
+
+SmolVLA는 MEAN_STD로 action이 [-1,1] 범위 → loss 정상 수렴.
+
+**[원인 2: VLM encoder 동결 — 단독으로는 문제 없음]**
+
+```
+freeze_vision_encoder=true + freeze_language_encoder=true
+→ 학습 가능: 311M / 879M (Florence-2 backbone 전체 동결)
+```
+
+동결 자체는 합리적인 전략:
+- X-VLA 사전학습에서 이미 manipulation 데이터로 학습된 Florence-2 피처를 그대로 재활용
+- SoftPromptedTransformer만 SO-100 태스크에 적응시키는 것이 목표
+
+**단, 원인 1(IDENTITY 정규화)과 결합되면 치명적:**
+- 사전학습 시 SoftPromptedTransformer는 normalized action space([-1,1] 근처)에서 학습됨
+- IDENTITY 정규화로 fine-tuning하면 raw degree(0~180) 스케일의 완전히 다른 target을 학습 강요
+- 사전학습 weight가 있어도 오히려 이를 망가뜨리는 방향으로 작용
+
+→ **동결 + MEAN_STD** 조합이었다면 사전학습 피처 재활용 + 정상 학습이 가능했을 것
+
+**[원인 3: 이미지 강제 리사이즈 480×640 → 224×224]**
+
+- DaViT square 제약으로 불가피했지만 (Section 12.4), pre-training distribution과 괴리
+- 동결된 encoder에 축소된 이미지 입력 → encoder 출력 피처 품질 저하
+
+**[원인 4: 12GB VRAM 제약의 복합 효과]**
+
+원인 2, 3은 모두 12GB VRAM 한계를 맞추기 위한 불가피한 선택:
+
+| 제약 | VRAM 절감 | 학습 품질 영향 |
+|------|----------|--------------|
+| bfloat16 | ~50% 절감 | 미미 |
+| VLM 동결 | 대폭 절감 | 피처 미적응 |
+| 224×224 리사이즈 | 소폭 절감 | pre-training 분포 괴리 |
+| ACTION: IDENTITY | 없음 | **치명적 — loss 발산** |
+
+**[원인 5: 데이터/파라미터 불균형]**
+
+- 879M 모델 × 50 에피소드: SmolVLA(450M)보다 파라미터/데이터 비율이 더 불리
+- X-VLA 논문의 fine-tuning은 충분한 태스크 데이터 가정
+
+### 13.3 SmolVLA vs X-VLA 비교
+
+| 항목 | SmolVLA | X-VLA |
+|------|---------|-------|
+| 모델 크기 | 450M | 879M |
+| 학습 가능 파라미터 | 전체 | 311M (encoder 동결) |
+| Action 정규화 | MEAN_STD ✓ | IDENTITY ✗ |
+| 이미지 크기 | 원본 유지 | 480×640 → 224×224 강제 리사이즈 |
+| 최종 loss | 수렴 | 6,275,072 (실패) |
+| Mode collapse | home position 수렴 | 무의미한 고정값 |
+| Frame 0 에러 | 0.14 | 77.26 |
+
+### 13.4 제대로 학습하려면 (워크스테이션 환경 기준)
+
+**노트북(12GB)에서도 가능한 수정:**
+
+| 수정 사항 | 이유 |
+|----------|------|
+| `ACTION: MEAN_STD` 정규화 | loss 스케일 정상화 — **최우선, 반드시 필요** |
+| encoder 동결 유지 가능 | 사전학습 피처 재활용, VRAM 절감 |
+
+**워크스테이션(96GB)에서 추가 가능:**
+
+| 수정 사항 | 이유 |
+|----------|------|
+| encoder freeze 해제 | SO-100 완전 도메인 적응 |
+| 원본 해상도 480×640 유지 | pre-training 분포 유지 |
+| batch_size 32+ | gradient 안정화 |
+| 에피소드 수 200+ | 파라미터/데이터 비율 개선 |
+
+→ **X-VLA 논문의 성능은 실제로 좋다. 이번 실패의 핵심은 ACTION: IDENTITY 설정 오류 하나이며, MEAN_STD로만 바꿔도 노트북에서도 유의미한 결과가 나올 가능성이 있다.**
+
+### 13.5 공식 lerobot 문서와의 차이 (근본 원인)
+
+참고: https://huggingface.co/docs/lerobot/xvla
+
+| 항목 | 공식 docs | 이번 실험 | 문제 여부 |
+|------|-----------|----------|---------|
+| pretrained model | `lerobot/xvla-base` (HF 공식) | `pretrained/xvla_pt` (원본 레포 수동 패치) | **핵심 문제** |
+| action_mode | `--policy.action_mode=auto` | 미설정 | **핵심 문제** |
+| freeze 설정 | `false` 권장 | `true` (VRAM 때문에 강제) | 불가피 |
+| pip install | `pip install -e .[xvla]` | 완료됨 (transformers 5.3.0) | 문제 없음 |
+
+**`lerobot/xvla-base`가 핵심:**
+- `pretrained/xvla_pt`는 원본 X-VLA 레포 weight를 lerobot에 억지로 맞춘 것 → processor JSON 수동 생성, config 수동 패치 필요
+- `lerobot/xvla-base`는 lerobot 통합용으로 새로 준비된 weight → processor/config 올바르게 포함
+
+**`action_mode=auto`를 안 쓴 것:**
+- SO-100은 6 DOF인데 기본 action_mode에서 차원 불일치 발생 가능
+- `auto` 모드: dataset의 실제 action 차원 감지 + loss를 real_dim에만 계산
+
+### 13.6 올바른 재실험 커맨드
+
+```bash
+cd /home/jake/lerobot/src && PYTORCH_ALLOC_CONF=expandable_segments:True \
+conda run -n smolvla python -u -m lerobot.scripts.lerobot_train \
+  --policy.path=lerobot/xvla-base \
+  --dataset.repo_id=lerobot/svla_so100_pickplace \
+  --output_dir=outputs/xvla_proper \
+  --policy.push_to_hub=false \
+  --job_name=xvla_proper \
+  --steps=20000 \
+  --batch_size=4 \
+  --policy.dtype=bfloat16 \
+  --policy.action_mode=auto \
+  --policy.freeze_vision_encoder=false \
+  --policy.freeze_language_encoder=false \
+  --policy.train_policy_transformer=true \
+  --policy.train_soft_prompts=true \
+  --policy.resize_imgs_with_padding="[224,224]"
+```
+
+OOM 발생 시: `--policy.freeze_vision_encoder=true --policy.freeze_language_encoder=true --batch_size=2`
+
+---
+
+## 14. 스터디 체크리스트
 
 - [x] X-VLA 레포 fork & clone (`~/X-VLA/`)
 - [x] lerobot 내 xvla 통합 확인 (`lerobot/src/lerobot/policies/xvla/`)
@@ -659,8 +812,8 @@ conda run -n smolvla python -m lerobot.scripts.lerobot_train \
 - [x] 나머지 파일 역할 파악 (`modeling_florence2.py`, `action_hub.py` 등, Section 11)
 - [x] lerobot fine-tuning 환경 설정 (config 호환성, processor, 이미지 리사이즈, Section 12)
 - [x] lerobot fine-tuning 실험 시작 (so100_pickplace 100K steps, 현재 학습 중)
+- [x] 학습 결과 분석 및 SmolVLA와 성능 비교 (Section 13 — 학습 실패, 원인 분석 완료)
 - [ ] 논문 Figure 2 (heterogeneity 해결 방법 비교) 이해
-- [ ] 학습 결과 분석 및 SmolVLA와 성능 비교
 - [ ] LoRA fine-tuning 실험 (`peft_train.py`)
 - [ ] LIBERO 시뮬레이션 eval 환경 설치 및 실행
 - [ ] Soft Prompt embedding 시각화/분석
